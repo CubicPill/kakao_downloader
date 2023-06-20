@@ -8,13 +8,31 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 
 import ffmpeg
-from PIL import Image
 
 _MAGICK_BIN = shutil.which('magick')
 _print_lock = Lock()
 GIF_ALPHA_THRESHOLD = 1
 WEBM_SIZE_KB_MAX = 256
 WEBM_DURATION_SEC_MAX = 3
+_counter_lock = Lock()
+_task_completed_counter = 0
+
+
+def get_counter_value():
+    with _counter_lock:
+        return _task_completed_counter
+
+
+def increment_counter():
+    with _counter_lock:
+        global _task_completed_counter
+        _task_completed_counter += 1
+
+
+def reset_counter():
+    with _counter_lock:
+        global _task_completed_counter
+        _task_completed_counter = 0
 
 
 class OutputFormat(Enum):
@@ -53,42 +71,34 @@ class KakaoProcessor(Thread):
 
     def run(self) -> None:
 
-        # first, use imagemagick to split frames
-        # use PIL to convert, ensure it's proper transparent png
-        # then get frame duration, geometry, blending method, disposal method
-        # finally use ffmpeg to convert to webm
-        # then it can then be fed into regular processor
-
         while not self.queue.empty():
             try:
                 task: ProcessTask = self.queue.get_nowait()
             except Empty:
                 continue
             self._current_sticker_id = task.sticker_id
-            result_temp_path = os.path.join(self.temp_dir, f'{task.sticker_id}.{self.output_format.value}.tmp')
             try:
                 # frames need to be split first before processing
                 frame_temp_dir = self.make_frame_temp_dir()
-                durations = self.split_webp_frames(task.in_img, frame_temp_dir)
 
+                curr_in = task.in_img
                 for i, op in enumerate(task.operations):
+                    curr_out = os.path.join(self.temp_dir, f'{self._current_sticker_id}_interim_{i}.tmp')
                     if op == Operation.SCALE:
-                        self.scale_frames(task.scale_px, frame_temp_dir)
+                        self.scale(curr_in, curr_out, task.scale_px)
                     elif op == Operation.REMOVE_ALPHA:
-                        self.remove_alpha_frames(frame_temp_dir)
+                        self.remove_alpha(curr_in, curr_out)
                     elif op == Operation.TO_GIF:
-                        self.to_gif(durations, frame_temp_dir, result_temp_path)
+                        self.to_gif(curr_in, curr_out)
                     elif op == Operation.TO_WEBM:
-                        webm_interim = os.path.join(self.temp_dir, f'{self._current_sticker_id}.raw.webm')
-                        self.to_webm(durations, frame_temp_dir, webm_interim)
-                        self.cap_webm_duration_and_size(durations, webm_interim, frame_temp_dir, result_temp_path)
+                        frame_dir = self.make_frame_temp_dir()
+                        durations = self.split_webp_frames(curr_in, frame_dir)
+                        webm_uncapped = os.path.join(self.temp_dir, f'{self._current_sticker_id}.raw.webm')
+                        self.to_webm(durations, frame_temp_dir, webm_uncapped)
+                        self.cap_webm_duration_and_size(durations, webm_uncapped, frame_temp_dir, curr_out)
+                    curr_in = curr_out
+                shutil.copy(curr_in, task.result_path)
 
-                shutil.copy(result_temp_path, task.result_path)
-
-            # try:
-            #     interim_file_path = os.path.join(self.temp_dir, f'conv_{uid}.webm')
-            #     durations = self.to_webm(uid, in_file, interim_file_path)
-            #     self.check_and_adjust_duration(uid, durations, interim_file_path, out_file)
             except ffmpeg.Error as e:
                 with _print_lock:
                     print('Error occurred while processing', e, task.sticker_id)
@@ -107,6 +117,7 @@ class KakaoProcessor(Thread):
                 return
             finally:
                 self.queue.task_done()
+                increment_counter()
 
     def make_frame_temp_dir(self):
         frame_working_dir_path = os.path.join(self.temp_dir, 'frames_' + self._current_sticker_id)
@@ -117,47 +128,64 @@ class KakaoProcessor(Thread):
     def _make_frame_file(self, durations, frame_working_dir_path):
         with open(os.path.join(frame_working_dir_path, 'frames.txt'), 'w') as f:
             for i, d in enumerate(durations):
-                f.write(f"file 'frame-{i}.png'\n")
+                f.write(f"file 'frame-{i:02d}.png'\n")
                 f.write(f'duration {d}\n')
             # last frame need to be put twice, see: https://trac.ffmpeg.org/wiki/Slideshow
-            f.write(f"file 'frame-{len(durations) - 1}.png'\n")
+            # f.write(f"file 'frame-{len(durations) - 1}.png'\n")
         return os.path.join(frame_working_dir_path, 'frames.txt')
 
-    def scale_frames(self, scale_px, frame_dir):
-        frame_scale_temp_dir = os.path.join(frame_dir, 'scale')
-        if not os.path.isdir(frame_scale_temp_dir):
-            os.mkdir(frame_scale_temp_dir)
-        for frame_file in os.listdir(frame_dir):
-            if frame_file.endswith('.png'):
-                ffmpeg.input(os.path.join(frame_dir, frame_file)) \
-                    .filter('scale', w=f'if(gt(iw,ih),{scale_px},-1)', h=f'if(gt(iw,ih),-1,{scale_px})') \
-                    .output(os.path.join(frame_scale_temp_dir, frame_file)) \
-                    .overwrite_output() \
-                    .run(quiet=True)
-        # remove original and move scaled to original location
-        for frame_file in os.listdir(frame_scale_temp_dir):
-            os.remove(os.path.join(frame_dir, frame_file))
-            shutil.move(os.path.join(frame_scale_temp_dir, frame_file), os.path.join(frame_dir, frame_file))
-        os.rmdir(frame_scale_temp_dir)
+    def scale(self, in_file, out_file, scale_px):
+        subprocess.call(
+                ['magick', 'convert', 'WEBP:' + in_file, '-resize', f'{scale_px}x{scale_px}', 'WEBP:' + out_file])
 
-    def remove_alpha_frames(self, frame_dir):
-        frame_scale_temp_dir = os.path.join(frame_dir, 'alpharm')
-        if not os.path.isdir(frame_scale_temp_dir):
-            os.mkdir(frame_scale_temp_dir)
-        for frame_file in os.listdir(frame_dir):
-            subprocess.call(
-                    ['magick', 'convert', frame_file, '-background', 'white', '-alpha', 'remove', '-alpha', 'off',
-                     os.path.join(frame_scale_temp_dir, frame_file)])
-        # remove original and move scaled to original location
-        for frame_file in os.listdir(frame_scale_temp_dir):
-            os.remove(os.path.join(frame_dir, frame_file))
-            shutil.move(os.path.join(frame_scale_temp_dir, frame_file), os.path.join(frame_dir, frame_file))
-        os.rmdir(frame_scale_temp_dir)
+    # def scale_frames(self, scale_px, frame_dir):
+    #     frame_scale_temp_dir = os.path.join(frame_dir, 'scale')
+    #     if not os.path.isdir(frame_scale_temp_dir):
+    #         os.mkdir(frame_scale_temp_dir)
+    #     for frame_file in os.listdir(frame_dir):
+    #         if frame_file.endswith('.png'):
+    #             ffmpeg.input(os.path.join(frame_dir, frame_file)) \
+    #                 .filter('scale', w=f'if(gt(iw,ih),{scale_px},-1)', h=f'if(gt(iw,ih),-1,{scale_px})') \
+    #                 .output(os.path.join(frame_scale_temp_dir, frame_file)) \
+    #                 .overwrite_output() \
+    #                 .run(quiet=True)
+    #     # remove original and move scaled to original location
+    #     for frame_file in os.listdir(frame_scale_temp_dir):
+    #         os.remove(os.path.join(frame_dir, frame_file))
+    #         shutil.move(os.path.join(frame_scale_temp_dir, frame_file), os.path.join(frame_dir, frame_file))
+    #     os.rmdir(frame_scale_temp_dir)
+
+    def remove_alpha(self, in_file, out_file):
+        subprocess.call(['magick', 'convert', 'WEBP:' + in_file, '-background',
+                         'white', '-alpha', 'remove', '-alpha', 'off',
+                         'WEBP:' + out_file])
+
+    # def remove_alpha_frames(self, frame_dir):
+    #     frame_scale_temp_dir = os.path.join(frame_dir, 'alpharm')
+    #     if not os.path.isdir(frame_scale_temp_dir):
+    #         os.mkdir(frame_scale_temp_dir)
+    #     for frame_file in os.listdir(frame_dir):
+    #         subprocess.call(
+    #                 ['magick', 'convert', frame_file, '-background', 'white', '-alpha', 'remove', '-alpha', 'off',
+    #                  os.path.join(frame_scale_temp_dir, frame_file)])
+    #     # remove original and move scaled to original location
+    #     for frame_file in os.listdir(frame_scale_temp_dir):
+    #         os.remove(os.path.join(frame_dir, frame_file))
+    #         shutil.move(os.path.join(frame_scale_temp_dir, frame_file), os.path.join(frame_dir, frame_file))
+    #     os.rmdir(frame_scale_temp_dir)
+
+    def to_gif(self, in_file, out_file):
+        # use imagemagick to convert webp to gif
+        subprocess.call(
+                ['magick', 'convert', 'WEBP:' + in_file, '-channel', 'A', '-threshold', '99%', 'GIF:' + out_file])
+        subprocess.call(['magick', 'GIF:' + out_file, '-coalesce', 'GIF:' + out_file])
 
     def split_webp_frames(self, in_file, frame_dir):
         # split frames using imagemagick, and reconstruct frames based on disposal/blending
-
-        subprocess.call([_MAGICK_BIN, in_file, os.path.join(frame_dir, 'frame-%d.png')], shell=False)
+        if not os.path.isdir(frame_dir):
+            os.mkdir(frame_dir)
+        subprocess.call(
+                [_MAGICK_BIN, 'WEBP:' + in_file, '-coalesce', os.path.join(frame_dir, 'frame-%02d.png')])
 
         p = subprocess.Popen(
                 [_MAGICK_BIN, 'identify', '-format', r'%T,%W,%H,%w,%h,%X,%Y,%[webp:mux-blend],%D|', in_file],
@@ -174,59 +202,17 @@ class KakaoProcessor(Thread):
             image_w, image_h = cw, ch
             frame_data.append((duration, (w, h, x, y), blend_method, dispose_method))
 
-        # added for debugging purposes
-        # if not os.path.isdir(os.path.join(frame_dir, 'raw')):
+        # # added for debugging purposes
+        # try:
         #     os.mkdir(os.path.join(frame_dir, 'raw'))
+        # except:
+        #     pass
         # for i in os.listdir(frame_dir):
         #     if i.startswith('frame-') and i.endswith('.png'):
         #         shutil.copy(os.path.join(frame_dir, i), os.path.join(frame_dir, 'raw'))
 
-        self._process_blend_and_dispose(frame_data, frame_dir, image_h, image_w)
-
         durations = [f[0] for f in frame_data]
         return durations
-
-    def _process_blend_and_dispose(self, frame_data, frame_dir, image_h, image_w):
-        # background color should be transparent
-        canvas = Image.new('RGBA', (image_w, image_h), (255, 255, 255, 0))
-        for i, d in enumerate(frame_data):
-            # since dispose_method applies to after displaying current frame,
-            # for this frame we need data from last frame
-            duration, (w, h, x, y), blend_method, _ = d
-            if i == 0:
-                dispose_method = 'None'
-                _w, _h, _x, _y = 0, 0, 0, 0  # make linter happy
-            else:
-                _, (_w, _h, _x, _y), _, dispose_method = frame_data[i - 1]
-
-            frame_file = os.path.join(frame_dir, f'frame-{i}.png')
-            frame_image = Image.open(frame_file).convert('RGBA')
-
-            if dispose_method == 'Background':
-                # last frame to be disposed to background color (transparent)
-                rect = Image.new('RGBA', (_w, _h), (255, 255, 255, 0))
-                canvas.paste(rect, (_x, _y, _w + _x, _h + _y))
-
-            # else do not dispose, do nothing
-            if blend_method == 'AtopPreviousAlphaBlend':  # do not blend
-                canvas.paste(frame_image, (x, y, w + x, h + y))
-            else:  # alpha blending
-                try:
-                    canvas.paste(frame_image, (x, y, w + x, h + y), frame_image)
-                except Exception as e:
-                    print(frame_file, e)
-                    raise Exception
-
-            canvas.save(os.path.join(frame_dir, f'frame-{i}.png'))
-
-    def to_gif(self, durations, frame_dir, out_file):
-        frame_file_path = self._make_frame_file(durations, frame_dir)
-        palette_stream = ffmpeg.input(frame_file_path, format='concat').filter('palettegen', reserve_transparent=1)
-        ffmpeg.filter([ffmpeg.input(frame_file_path, format='concat'), palette_stream], 'paletteuse',
-                      alpha_threshold=GIF_ALPHA_THRESHOLD) \
-            .output(out_file, f='gif') \
-            .overwrite_output() \
-            .run(quiet=True)
 
     def to_webm(self, durations, frame_dir, out_file):
         # framerate is needed here since telegram ios client will use framerate as play speed
@@ -237,10 +223,11 @@ class KakaoProcessor(Thread):
         # also 1/framerate seems to be the minimum unit of ffmpeg to encode frame duration
         # so shouldn't set it too small - which will cause too much error
         # https://bugs.telegram.org/c/14778
+
         frame_file_path = self._make_frame_file(durations, frame_dir)
         ffmpeg.input(frame_file_path, format='concat') \
             .filter('scale', w='if(gt(iw,ih),512,-1)', h='if(gt(iw,ih),-1,512)') \
-            .output(out_file, r=30, vsync=1, f='webm') \
+            .output(out_file, r=30, fps_mode='cfr', f='webm') \
             .overwrite_output() \
             .run(quiet=True)
 
@@ -256,7 +243,9 @@ class KakaoProcessor(Thread):
         return duration_seconds
 
     def cap_webm_duration_and_size(self, durations, in_webm, frame_dir, out_file):
-        # probe, ensure it's max 3 seconds
+        # TODO even after optimization, webm file size may still exceed the limit. Lossy compression may be needed
+
+        # probe duration, ensure it's max 3 seconds
         duration_seconds = self.probe_duration(in_webm)
 
         if duration_seconds > WEBM_DURATION_SEC_MAX:
@@ -272,3 +261,9 @@ class KakaoProcessor(Thread):
                     break
         else:  # just copy
             shutil.copyfile(in_webm, out_file)
+
+        # see if file size is OK
+        if os.path.getsize(out_file) > WEBM_SIZE_KB_MAX * 1024:
+            # TODO optimize file size
+            with _print_lock:
+                print(f'WARNING: File size too large, {os.path.getsize(out_file) / 1024} KB')

@@ -14,10 +14,10 @@ import requests
 from tqdm import tqdm
 
 from decrypt import data_xor
-from kakao_process import KakaoProcessor, Operation, OutputFormat, ProcessTask
+from kakao_process import KakaoProcessor, Operation, OutputFormat, ProcessTask, get_counter_value
 
 _HEADER_KAKAO = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 KAKAOTALK 10.2.4'}
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 12; SM-A226L Build/SP1A.210812.016; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/108.0.5359.128 Mobile Safari/537.36;KAKAOTALK 2410030'}
 
 _HEADER_CHROME_DEFAULT = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'}
@@ -79,6 +79,9 @@ def main():
 
     arg_parser.add_argument('--output-fmt', type=str, help='Output format', default='none',
                             choices=['none', 'gif', 'webm'], )
+    arg_parser.add_argument('-o', '--output-dir', type=str, help='Output directory for processed stickers')
+    # works for gif, png and webm. For mp4 video, alpha is always removed
+    arg_parser.add_argument('--remove-alpha', help='Replace transparent background with white', action='store_true')
 
     arg_parser.add_argument('-t', '--threads', type=int, help='Thread number of processor, default 8', default=8)
 
@@ -103,13 +106,19 @@ def main():
     output_fmt = args.output_fmt
     skip_confirmation = args.y
     no_sub_dir = args.no_subdir
+    if_remove_alpha = args.remove_alpha
     open_folder = args.show
     quiet = args.quiet
-
+    if not args.output_dir:
+        default_sticker_output_root_dir = os.path.join(os.getcwd(), 'sticker_out')
+    else:
+        default_sticker_output_root_dir = args.output_dir
     global norm_print
     if quiet:
         norm_print = lambda *args, **kwargs: None
         skip_confirmation = True
+    if not os.path.exists(default_sticker_output_root_dir):
+        os.mkdir(default_sticker_output_root_dir)
 
     if 'http' not in id_url:
         num_pack_id = id_url
@@ -164,6 +173,7 @@ def main():
         norm_print('Output format:', output_fmt)
     if scale_px:
         norm_print('Scale:', f'{scale_px}*{scale_px}px')
+    norm_print('Output directory:', default_sticker_output_root_dir)
     norm_print('----------------------------------------------------')
     if not skip_confirmation:
         confirm = input('Do you wish to continue? Y/n: ')
@@ -286,6 +296,8 @@ def main():
         operations = []
         if scale_px:
             operations.append(Operation.SCALE)
+        if if_remove_alpha:
+            operations.append(Operation.REMOVE_ALPHA)
         if output_format == OutputFormat.GIF:
             operations.append(Operation.TO_GIF)
         elif output_format == OutputFormat.WEBM:
@@ -302,12 +314,12 @@ def main():
 
     if not quiet:
         with tqdm(total=sticker_count) as bar:
-            last = sticker_count
+            last = 0
             while not process_queue.empty():
-                qsize = process_queue.qsize()
-                bar.update(last - qsize)
+                completed = get_counter_value()
+                bar.update(completed - last)
                 bar.refresh()
-                last = qsize
+                last = completed
                 time.sleep(0.5)
             process_queue.join()
             bar.n = sticker_count
@@ -320,6 +332,8 @@ def main():
 
     # remove temp dir
     shutil.rmtree(sticker_process_temp_root)
+    # debug
+    # os.startfile(sticker_process_temp_root)
     if open_folder:
         os.startfile(sticker_output_path)
 
